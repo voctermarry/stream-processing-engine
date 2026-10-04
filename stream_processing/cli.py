@@ -20,14 +20,26 @@ import tempfile
 from typing import Any, Sequence
 
 from . import __version__
+from .checkpoint import (
+    CHECKPOINT_FORMAT,
+    CHECKPOINT_VERSION,
+    RunConfig,
+    read_checkpoint,
+    run_with_checkpoint,
+)
 from .errors import OutputError, StreamProcessingError, ValidationError
 from .events import parse_event_line
 from .pipeline import AGGREGATORS, Pipeline
-from .windows import Session, Sliding, Tumbling, session, sliding, tumbling
+from .windows import Session, Sliding, Tumbling, parse_window_spec
 
 EXIT_OK = 0
 EXIT_ERROR = 2
 EXIT_REPORT_MISMATCH = 3
+
+DEFAULT_WINDOW = "tumbling:1000"
+DEFAULT_AGGREGATION = "sum"
+DEFAULT_LATENESS = 0
+DEFAULT_DISORDER = 0
 
 
 def canonical(document: dict[str, Any]) -> str:
@@ -36,26 +48,8 @@ def canonical(document: dict[str, Any]) -> str:
 
 
 def _parse_window(spec: str) -> Tumbling | Sliding | Session:
-    parts = spec.split(":")
-    kind = parts[0]
-    try:
-        numbers = [int(part) for part in parts[1:]]
-    except ValueError as error:
-        raise ValidationError(f"window numbers must be integers: {spec}", value=spec) from error
-    if kind == "tumbling" and len(numbers) == 1:
-        return tumbling(numbers[0])
-    if kind == "tumbling" and len(numbers) == 2:
-        return tumbling(numbers[0], numbers[1])
-    if kind == "sliding" and len(numbers) == 2:
-        return sliding(numbers[0], numbers[1])
-    if kind == "sliding" and len(numbers) == 3:
-        return sliding(numbers[0], numbers[1], numbers[2])
-    if kind == "session" and len(numbers) == 1:
-        return session(numbers[0])
-    raise ValidationError(
-        "window spec must be tumbling:<size>[:<offset>], sliding:<size>:<slide>[:<offset>] or session:<gap>",
-        value=spec,
-    )
+    # Shared grammar lives with the window model so checkpoint resume builds the identical assigner.
+    return parse_window_spec(spec)
 
 
 def _read_lines(path: str) -> list[str]:
@@ -127,6 +121,12 @@ def _command_describe(_: argparse.Namespace) -> int:
         "eventKinds": ["data", "punct"],
         "timestampUnit": "milliseconds",
         "exitCodes": {"ok": EXIT_OK, "error": EXIT_ERROR, "reportMismatch": EXIT_REPORT_MISMATCH},
+        "checkpoint": {
+            "format": CHECKPOINT_FORMAT,
+            "version": CHECKPOINT_VERSION,
+            "resumeSupported": True,
+            "options": ["run --checkpoint <path>", "run --resume <path>"],
+        },
     }
     sys.stdout.write(canonical(document) + "\n")
     return EXIT_OK
@@ -145,9 +145,84 @@ def _command_windows(args: argparse.Namespace) -> int:
 
 def _command_run(args: argparse.Namespace) -> int:
     _assert_distinct([args.input], args.output)
-    lines = _collect(args.input, args.window, args.aggregation, args.allowed_lateness, args.max_out_of_orderness)
-    _write(args.output, lines)
+    checkpoint_path = args.checkpoint or args.resume
+    if checkpoint_path is None:
+        # Legacy path: output, errors and exit codes are unchanged when the new options are absent.
+        window = args.window or DEFAULT_WINDOW
+        aggregation = args.aggregation or DEFAULT_AGGREGATION
+        lateness = args.allowed_lateness if args.allowed_lateness is not None else DEFAULT_LATENESS
+        disorder = args.max_out_of_orderness if args.max_out_of_orderness is not None else DEFAULT_DISORDER
+        lines = _collect(args.input, window, aggregation, lateness, disorder)
+        _write(args.output, lines)
+        return EXIT_OK
+
+    if args.checkpoint and args.resume:
+        raise ValidationError("--checkpoint and --resume are mutually exclusive")
+    # A durable run needs a seekable, verifiable regular input and an explicit file output: stdin
+    # cannot be prefix-verified on restart and stdout cannot be atomically replaced.
+    if args.input == "-" or not os.path.isfile(args.input):
+        raise ValidationError("checkpointed run requires a regular file as --input", value=args.input)
+    if not args.output or args.output == "-":
+        raise ValidationError("checkpointed run requires an explicit non-stdout --output")
+    target = os.path.abspath(args.output)
+    if os.path.abspath(checkpoint_path) == target:
+        raise ValidationError("checkpoint path must differ from --output", value=checkpoint_path)
+    if os.path.abspath(checkpoint_path) == os.path.abspath(args.input):
+        raise ValidationError("checkpoint path must differ from --input", value=checkpoint_path)
+
+    if args.checkpoint:
+        # A fresh checkpointed run never silently clobbers durable state: an existing checkpoint at
+        # this path must be continued with --resume, not overwritten.
+        if os.path.exists(checkpoint_path):
+            raise ValidationError("checkpoint already exists; use --resume to continue it", value=checkpoint_path)
+        config = RunConfig(
+            window=args.window or DEFAULT_WINDOW,
+            aggregation=args.aggregation or DEFAULT_AGGREGATION,
+            allowed_lateness=args.allowed_lateness if args.allowed_lateness is not None else DEFAULT_LATENESS,
+            max_out_of_orderness=(
+                args.max_out_of_orderness if args.max_out_of_orderness is not None else DEFAULT_DISORDER
+            ),
+        )
+        resume_document = None
+    else:
+        # Resume: malformed/unreadable checkpoints surface here, before any output or state change.
+        resume_document = read_checkpoint(checkpoint_path)
+        config = _resolve_resume_config(args, RunConfig.from_document(resume_document["config"]))
+
+    run_with_checkpoint(
+        input_path=args.input,
+        output_path=args.output,
+        checkpoint_path=checkpoint_path,
+        config=config,
+        resume_document=resume_document,
+    )
     return EXIT_OK
+
+
+def _resolve_resume_config(args: argparse.Namespace, saved: RunConfig) -> RunConfig:
+    """Adopt the checkpointed configuration; any explicitly passed, differing value is a conflict.
+
+    Omitting a config flag means "use what the checkpoint recorded"; passing the identical value is
+    harmless; passing a different value is a validation_error rather than a silent override.
+    """
+    conflicts: dict[str, object] = {}
+    if args.window is not None and args.window != saved.window:
+        conflicts["window"] = {"passed": args.window, "checkpoint": saved.window}
+    if args.aggregation is not None and args.aggregation != saved.aggregation:
+        conflicts["aggregation"] = {"passed": args.aggregation, "checkpoint": saved.aggregation}
+    if args.allowed_lateness is not None and args.allowed_lateness != saved.allowed_lateness:
+        conflicts["allowedLateness"] = {
+            "passed": args.allowed_lateness,
+            "checkpoint": saved.allowed_lateness,
+        }
+    if args.max_out_of_orderness is not None and args.max_out_of_orderness != saved.max_out_of_orderness:
+        conflicts["maxOutOfOrderness"] = {
+            "passed": args.max_out_of_orderness,
+            "checkpoint": saved.max_out_of_orderness,
+        }
+    if conflicts:
+        raise ValidationError("resume configuration conflicts with the checkpoint", **conflicts)
+    return saved
 
 
 def _command_replay(args: argparse.Namespace) -> int:
@@ -187,11 +262,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     run = subparsers.add_parser("run", help="process JSONL events")
     run.add_argument("--input", required=True)
-    run.add_argument("--window", default="tumbling:1000")
-    run.add_argument("--aggregation", default="sum", choices=sorted(AGGREGATORS))
-    run.add_argument("--allowed-lateness", type=int, default=0)
-    run.add_argument("--max-out-of-orderness", type=int, default=0)
+    run.add_argument("--window", default=None)
+    run.add_argument("--aggregation", default=None, choices=sorted(AGGREGATORS))
+    run.add_argument("--allowed-lateness", type=int, default=None)
+    run.add_argument("--max-out-of-orderness", type=int, default=None)
     run.add_argument("--output")
+    run.add_argument("--checkpoint", help="persist a durable checkpoint after each line to this file")
+    run.add_argument("--resume", help="continue from a checkpoint file written by --checkpoint")
     run.set_defaults(handler=_command_run)
 
     replay = subparsers.add_parser("replay", help="process twice and reconcile")

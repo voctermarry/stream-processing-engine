@@ -79,6 +79,38 @@ class WatermarkTracker:
         current = self.current
         return current is not None and current >= end
 
+    def snapshot(self) -> dict[str, Any]:
+        """A plain-data capture of every bit of tracker state (deterministic checkpoint support)."""
+        return {
+            "maxOutOfOrderness": self.max_out_of_orderness,
+            "maxSeen": self._max_seen,
+            "lateDropped": self.late_dropped,
+            "observed": self.observed,
+        }
+
+    def restore(self, state: dict[str, Any]) -> None:
+        """Rebuild tracker state from a snapshot produced by `snapshot`.
+
+        The four fields are validated as a unit: an invalid snapshot is rejected before any field
+        is assigned, so a failed restore never leaves a half-populated tracker.
+        """
+        moo = state.get("maxOutOfOrderness")
+        max_seen = state.get("maxSeen")
+        late_dropped = state.get("lateDropped")
+        observed = state.get("observed")
+        if not isinstance(moo, int) or isinstance(moo, bool) or moo < 0:
+            raise ValidationError("watermark maxOutOfOrderness must be a non-negative integer", value=moo)
+        if max_seen is not None and (not isinstance(max_seen, int) or isinstance(max_seen, bool)):
+            raise ValidationError("watermark maxSeen must be an integer or null", value=max_seen)
+        if not isinstance(late_dropped, int) or isinstance(late_dropped, bool) or late_dropped < 0:
+            raise ValidationError("watermark lateDropped must be a non-negative integer", value=late_dropped)
+        if not isinstance(observed, int) or isinstance(observed, bool) or observed < 0:
+            raise ValidationError("watermark observed must be a non-negative integer", value=observed)
+        self.max_out_of_orderness = moo
+        self._max_seen = max_seen
+        self.late_dropped = late_dropped
+        self.observed = observed
+
 
 def parse_event_line(text: str, *, line: int | None = None) -> Event:
     """Parse one JSON object into an Event, reporting a position on every failure."""

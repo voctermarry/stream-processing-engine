@@ -120,3 +120,27 @@ def sliding(size: int, slide: int, offset: int = 0) -> Sliding:
 
 def session(gap: int) -> Session:
     return Session(gap)
+
+
+def parse_window_spec(spec: str) -> Tumbling | Sliding | Session:
+    """Parse ``tumbling:<size>[:<offset>]`` / ``sliding:<size>:<slide>[:<offset>]`` / ``session:<gap>``."""
+    parts = spec.split(":")
+    kind = parts[0]
+    try:
+        numbers = [int(part) for part in parts[1:]]
+    except ValueError as error:
+        raise ValidationError(f"window numbers must be integers: {spec}", value=spec) from error
+    if kind == "tumbling" and len(numbers) == 1:
+        return tumbling(numbers[0])
+    if kind == "tumbling" and len(numbers) == 2:
+        return tumbling(numbers[0], numbers[1])
+    if kind == "sliding" and len(numbers) == 2:
+        return sliding(numbers[0], numbers[1])
+    if kind == "sliding" and len(numbers) == 3:
+        return sliding(numbers[0], numbers[1], numbers[2])
+    if kind == "session" and len(numbers) == 1:
+        return session(numbers[0])
+    raise ValidationError(
+        "window spec must be tumbling:<size>[:<offset>], sliding:<size>:<slide>[:<offset>] or session:<gap>",
+        value=spec,
+    )
