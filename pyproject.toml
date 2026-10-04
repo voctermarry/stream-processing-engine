@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "stream-processing-engine"
+version = "0.1.0"
+description = "Stateful event-time stream processing engine (stdlib only)"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+stream-processing-engine = "stream_processing.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["stream_processing*"]
