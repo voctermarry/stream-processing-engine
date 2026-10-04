@@ -2,10 +2,11 @@
 
 from .errors import OutputError, ParseError, StreamProcessingError, ValidationError, WindowError
 from .events import Event, WatermarkTracker, parse_event_line
-from .pipeline import Pipeline, Result
+from .pipeline import CHECKPOINT_VERSION, Pipeline, Result
 from .windows import Window, session, sliding, tumbling
 
 __all__ = [
+    "CHECKPOINT_VERSION",
     "Event",
     "OutputError",
     "ParseError",
