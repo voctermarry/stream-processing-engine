@@ -63,12 +63,47 @@ stream-processing-engine describe
 
 | 命令 | 作用 | 退出码 |
 |---|---|---|
-| `describe` | 打印能力清单（聚合、窗口规格、事件字段、退出码） | 0 |
+| `describe` | 打印能力清单（聚合、窗口规格、事件字段、退出码、检查点格式版本与恢复支持） | 0 |
 | `windows --window <spec> --from <ms> --to <ms>` | 打印与区间相交的窗口边界 | 0 / 2 |
 | `run --input <jsonl> [--window] [--aggregation] [--allowed-lateness] [--max-out-of-orderness] [--output]` | 处理事件并按行输出结果 | 0 / 2 |
+| `run … --checkpoint <cp>` / `--resume <cp>` | 持久化检查点与断点续跑（见下） | 0 / 2 |
 | `replay --input <jsonl> [--compare <jsonl>] …` | 处理两遍并逐字段对账；给出 `identical`，带 `--compare` 时再给出 `matchesReference` | 0 / 2 / **3** |
 
 `--input -` 读 stdin；未给 `--output` 写 stdout。**退出码 3** 表示"报告已产出但对账不一致"——报告本身仍然完整可读。
+
+## 检查点与断点恢复
+
+`run` 支持可持久化检查点，使一次中断的执行能从最后一个成功处理的输入行继续，且**最终结果文件与相同配置下一次不中断的 run 逐字节一致**。
+
+- 首次执行：`run --input <文件> --output <文件> --checkpoint <cp>`。
+- 恢复执行：`run --input <文件> --output <文件> --resume <cp>`，读取并**继续更新同一个文件**。
+- `--checkpoint` 与 `--resume` 互斥；启用任一项时，`--input` 必须是普通文件（不能是 stdin），`--output` 必须显式给出文件（不能是 stdout），否则统一返回 `validation_error`。
+- `--checkpoint` 的目标文件必须不存在（避免误覆盖）；`--resume` 的目标必须存在。
+
+**逐行原子落盘。** 每成功解析并处理一行，检查点文件就以"临时文件 + 原子替换"重写一次。处理后续输入发生 `parse_error` 时：输出文件保持原样，检查点停留在最后一个成功行（`status:"running"`）；修好输入后用 `--resume` 续跑即可。
+
+**恢复严格校验（任何一项失败都不会改动既有输出或检查点）：**
+
+- 先用 SHA-256 校验输入中**已消费前缀逐字节未变**，再从下一行继续；既不重计前缀事件，也不重复/遗漏已缓存的窗口结果；
+- 窗口、聚合、迟到与乱序配置沿用检查点保存的值；调用方显式传入冲突项（哪怕只是一项）返回 `validation_error`，**绝不静默覆盖**；不传则继承（包括默认值）；
+- 已消费偏移超出当前输入行数，返回 `validation_error`。
+
+**完成态。** 成功结束时先按原有方式原子替换完整结果文件，再留下 `status:"complete"` 的检查点。对完成态再次 `--resume` 是幂等的：重写同一份结果并刷新同一完成态标记；若完成后输入又增长（行数变多），返回 `validation_error`。
+
+**检查点格式**是规范化的单行 JSON（排序键、无空格、末尾一个换行），带固定标识与版本号，完整保存：
+
+| 字段 | 内容 |
+|---|---|
+| `format` / `version` / `status` | 固定标识 `stream-processing-checkpoint`、格式版本（当前 `1`）、`running` / `complete` |
+| `config` | 保存的 `window` / `aggregation` / `allowedLateness` / `maxOutOfOrderness` |
+| `consumed` | 已成功处理的输入行数 |
+| `prefixSha256` | 已消费前缀原始字节（含换行符）的 SHA-256 |
+| `state.values` | 键控窗口/会话状态：`[start,end,key,[values…]]` |
+| `state.emitted` | 已发射记录身份：`[start,end,key]` |
+| `state.watermarkMaxSeen` / `observed` / `lateDropped` | 水位线位置与迟到计数 |
+| `pending` | 已产生但尚未提交到最终文件的规范化输出行（有序） |
+
+检查点相关错误一律复用稳定错误种类：无法读取或原子写入检查点 ⇒ `output_error`；不是合法 JSON ⇒ 带 `line`/`column` 的 `parse_error`；格式标识未知、版本不支持、字段或类型非法、保存配置冲突、输入前缀校验失败、偏移超出当前输入 ⇒ `validation_error`。`describe` 在保留原字段的基础上以 `checkpoint.format` / `checkpoint.version` / `checkpoint.resume` 公开格式版本与恢复支持。
 
 ## 保障
 
@@ -84,6 +119,7 @@ stream_processing/errors.py    异常层次（kind + 上下文）
 stream_processing/events.py    事件解析与水位线
 stream_processing/windows.py   滚动/滑动/会话窗口与会话合并
 stream_processing/pipeline.py  有状态聚合与发射
+stream_processing/checkpoint.py 检查点格式、严格校验、原子写与状态绑定
 stream_processing/cli.py       四个子命令与退出码
-tests/                         窗口数学、解析错误、CLI 契约
+tests/                         窗口数学、解析错误、CLI 契约、恢复确定性与检查点
 ```
