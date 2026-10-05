@@ -112,6 +112,37 @@ def _assert_distinct(inputs: Sequence[str | None], output: str | None) -> None:
             raise OutputError("output path collides with an input path", value=output)
 
 
+class _Ingestion:
+    """The single event-ingestion and result-collection pass shared by every entry point.
+
+    Plain runs, checkpointed runs, resumes and both replay passes all feed their input through
+    this loop, so the parse / advance-watermark / collect-closed-windows / final-flush logic
+    exists exactly once and cannot drift between execution modes:
+
+      * each raw line is parsed with its original 1-based line number (a resumed run keeps the
+        file's numbering, so a parse_error always points at the real line),
+      * the windows an event closes at the current watermark are collected in emission order,
+      * exactly one end-of-input flush runs after the last line is fully consumed.
+
+    Durable mode shares its ``pending`` buffer with ``lines`` and persists after every
+    successfully consumed line; a failed line therefore never reaches the loop's result list
+    and the checkpoint stays at the last good line.
+    """
+
+    def __init__(self, pipeline: Pipeline, lines: list[str] | None = None) -> None:
+        self.pipeline = pipeline
+        self.lines = lines if lines is not None else []
+
+    def consume(self, text: str, *, line: int) -> None:
+        event = parse_event_line(text, line=line)
+        for result in self.pipeline.add(event):
+            self.lines.append(canonical(result.to_document()))
+
+    def finish(self) -> None:
+        for result in self.pipeline.flush():
+            self.lines.append(canonical(result.to_document()))
+
+
 def _collect(events_path: str, window_spec: str, aggregation: str, lateness: int, out_of_orderness: int) -> list[str]:
     pipeline = Pipeline(
         windowing=_parse_window(window_spec),
@@ -119,14 +150,11 @@ def _collect(events_path: str, window_spec: str, aggregation: str, lateness: int
         max_out_of_orderness=out_of_orderness,
         allowed_lateness=lateness,
     )
-    lines: list[str] = []
+    ingestion = _Ingestion(pipeline)
     for number, text in enumerate(_read_lines(events_path), start=1):
-        event = parse_event_line(text, line=number)
-        for result in pipeline.add(event):
-            lines.append(canonical(result.to_document()))
-    for result in pipeline.flush():
-        lines.append(canonical(result.to_document()))
-    return lines
+        ingestion.consume(text, line=number)
+    ingestion.finish()
+    return ingestion.lines
 
 
 def _command_describe(_: argparse.Namespace) -> int:
@@ -299,19 +327,17 @@ def _run_with_checkpoint(
         )
         return EXIT_OK
 
-    # Process every line strictly past the consumed prefix. Results accumulate in `pending`; they
-    # are committed to the final file only on successful completion, while the checkpoint after each
-    # line already durably holds them, so a crash between lines loses nothing.
+    # Process every line strictly past the consumed prefix through the same ingestion pass a
+    # plain run uses. The shared `pending` list IS the ingestion's result buffer: results are
+    # committed to the final file only on successful completion, while the checkpoint after
+    # each line already durably holds them, so a crash between lines loses nothing.
+    ingestion = _Ingestion(pipeline, pending)
     for number in range(consumed + 1, total + 1):
-        text = segments[number - 1].rstrip("\r\n")
-        event = parse_event_line(text, line=number)
-        for result in pipeline.add(event):
-            pending.append(canonical(result.to_document()))
+        ingestion.consume(segments[number - 1].rstrip("\r\n"), line=number)
         consumed = number
         persist(STATUS_RUNNING)
 
-    for result in pipeline.flush():
-        pending.append(canonical(result.to_document()))
+    ingestion.finish()
     consumed = total
 
     # Finish order: the full result file is atomically replaced exactly as an uninterrupted run
