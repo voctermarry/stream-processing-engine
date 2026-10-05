@@ -83,7 +83,7 @@ class Sliding:
 
 @dataclass(frozen=True, slots=True)
 class Session:
-    """Gap-based windows: events closer than `gap` ms share one window that keeps growing."""
+    """Gap-based windows: events whose timestamps differ by at most `gap` ms share one session."""
 
     gap: int
 
@@ -96,13 +96,18 @@ class Session:
 
 
 def merge_sessions(windows: Iterable[Window], gap: int) -> list[Window]:
-    """Merge windows whose gap is at most `gap`, in ascending order."""
+    """Merge windows whose event-time gap is at most `gap`, in ascending order.
+
+    Each event is a half-open point window ``[t, t+1)``, so two adjacent windows touch when the
+    distance from one end to the next start is strictly less than ``gap``: ``t2 - (t1 + 1) < gap``
+    is exactly ``t2 - t1 <= gap``. A timestamp difference of ``gap + 1`` must therefore stay split.
+    """
     if gap <= 0:
         raise ValidationError("session gap must be > 0", value=gap)
     ordered: Sequence[Window] = sorted(windows)
     merged: list[Window] = []
     for window in ordered:
-        if merged and window.start - merged[-1].end <= gap:
+        if merged and window.start - merged[-1].end < gap:
             previous = merged[-1]
             merged[-1] = Window(previous.start, max(previous.end, window.end))
         else:
