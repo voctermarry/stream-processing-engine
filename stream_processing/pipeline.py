@@ -118,6 +118,9 @@ class Pipeline:
                 identity = (window.start, window.end, aggregation_key)
                 if identity in self._emitted or not values:
                     continue
+                # window.end is lastTimestamp + 1, and an event exactly `gap` after the last one
+                # would still merge -- so the session closes only once the watermark reaches
+                # lastTimestamp + gap + 1 + allowed_lateness.
                 closed = force_end or self.watermark.is_closed(window.end + gap + self.allowed_lateness)
                 if not closed:
                     continue

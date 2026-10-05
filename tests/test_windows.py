@@ -48,13 +48,87 @@ class SessionTests(unittest.TestCase):
         merged = merge_sessions([Window(0, 10), Window(15, 20), Window(100, 110)], gap=10)
         self.assertEqual(merged, [Window(0, 20), Window(100, 110)])
 
-    def test_gap_boundary_is_inclusive(self) -> None:
-        merged = merge_sessions([Window(0, 10), Window(20, 30)], gap=10)
-        self.assertEqual(merged, [Window(0, 30)])
+    def test_gap_boundary_merges_timestamps_gap_apart(self) -> None:
+        # Events at 0 and 10 are exactly `gap` apart: their [t, t+1) windows are 9 apart and merge.
+        merged = merge_sessions([Window(0, 1), Window(10, 11)], gap=10)
+        self.assertEqual(merged, [Window(0, 11)])
+
+    def test_gap_boundary_splits_timestamps_gap_plus_one_apart(self) -> None:
+        # Events at 0 and 11 are `gap + 1` apart: the windows are 10 apart and must stay split.
+        merged = merge_sessions([Window(0, 1), Window(11, 12)], gap=10)
+        self.assertEqual(merged, [Window(0, 1), Window(11, 12)])
+
+    def test_gap_of_one_merges_only_adjacent_timestamps(self) -> None:
+        merged = merge_sessions([Window(0, 1), Window(1, 2), Window(3, 4)], gap=1)
+        self.assertEqual(merged, [Window(0, 2), Window(3, 4)])
 
     def test_invalid_gap_is_rejected(self) -> None:
         with self.assertRaises(ValidationError):
             merge_sessions([Window(0, 1)], gap=0)
+
+
+class SessionPipelineTests(unittest.TestCase):
+    def test_gap_is_the_maximum_merge_distance(self) -> None:
+        events = [Event(timestamp=t, key="a", value=1.0) for t in (0, 10, 21)]
+        results = Pipeline(windowing=session(10), aggregation="sum").run(events)
+        # 0 and 10 merge (diff == gap); 21 is gap + 1 away from 10 and stands alone.
+        self.assertEqual(
+            [(r.window.start, r.window.end, r.value, r.count) for r in results],
+            [(0, 11, 2.0, 2), (21, 22, 1.0, 1)],
+        )
+
+    def test_gap_boundary_with_negative_and_cross_zero_timestamps(self) -> None:
+        events = [Event(timestamp=t, key="a", value=1.0) for t in (-11, -1, 0, 10)]
+        results = Pipeline(windowing=session(10), aggregation="count").run(events)
+        # -11..-1 and -1..0 and 0..10 are each exactly gap apart: one transitive session.
+        self.assertEqual([(r.window.start, r.window.end, r.count) for r in results], [(-11, 11, 4)])
+
+    def test_same_timestamp_events_share_a_session(self) -> None:
+        events = [Event(timestamp=5, key="a", value=v) for v in (1.0, 2.0, 3.0)]
+        results = Pipeline(windowing=session(1), aggregation="sum").run(events)
+        self.assertEqual([(r.window.start, r.window.end, r.value, r.count) for r in results], [(5, 6, 6.0, 3)])
+
+    def test_out_of_order_bridge_merges_unemitted_sessions_once(self) -> None:
+        pipeline = Pipeline(windowing=session(10), aggregation="sum", max_out_of_orderness=100)
+        pipeline.add(Event(timestamp=0, key="a", value=1.0))
+        pipeline.add(Event(timestamp=20, key="a", value=2.0))
+        pipeline.add(Event(timestamp=10, key="a", value=4.0))  # timely bridge: joins both sides
+        results = pipeline.flush()
+        self.assertEqual([(r.window.start, r.window.end, r.value, r.count) for r in results], [(0, 21, 7.0, 3)])
+
+    def test_session_emits_only_when_watermark_passes_last_plus_gap(self) -> None:
+        pipeline = Pipeline(windowing=session(10), aggregation="sum")
+        pipeline.add(Event(timestamp=0, key="a", value=1.0))
+        # Watermark 10: an event at 10 (diff == gap) could still arrive, so nothing may emit.
+        self.assertEqual(pipeline.add(Event(timestamp=10, key="clock", kind="punct")), [])
+        # Watermark 11 == last + gap + 1: the boundary is provably passed, the session closes.
+        emitted = pipeline.add(Event(timestamp=11, key="clock", kind="punct"))
+        self.assertEqual([(r.window.start, r.window.end) for r in emitted], [(0, 1)])
+
+    def test_session_emission_respects_allowed_lateness(self) -> None:
+        pipeline = Pipeline(windowing=session(10), aggregation="sum", allowed_lateness=5)
+        pipeline.add(Event(timestamp=0, key="a", value=1.0))
+        self.assertEqual(pipeline.add(Event(timestamp=15, key="clock", kind="punct")), [])
+        emitted = pipeline.add(Event(timestamp=16, key="clock", kind="punct"))
+        self.assertEqual(len(emitted), 1)
+
+    def test_late_event_never_reopens_an_emitted_session(self) -> None:
+        pipeline = Pipeline(windowing=session(10), aggregation="sum")
+        pipeline.add(Event(timestamp=0, key="a", value=1.0))
+        emitted = pipeline.add(Event(timestamp=11, key="clock", kind="punct"))
+        self.assertEqual(len(emitted), 1)
+        # 5 is within the gap of the emitted session but below the watermark: dropped, not merged.
+        self.assertEqual(pipeline.add(Event(timestamp=5, key="a", value=99.0)), [])
+        self.assertEqual(pipeline.watermark.late_dropped, 1)
+        self.assertEqual(pipeline.flush(), [])
+
+    def test_keys_never_share_a_session(self) -> None:
+        events = [Event(timestamp=0, key="a", value=1.0), Event(timestamp=5, key="b", value=2.0)]
+        results = Pipeline(windowing=session(10), aggregation="sum").run(events)
+        self.assertEqual(
+            [(r.window.start, r.window.end, r.key) for r in results],
+            [(0, 1, "a"), (5, 6, "b")],
+        )
 
 
 class WatermarkTests(unittest.TestCase):
