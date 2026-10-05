@@ -17,7 +17,7 @@ import json
 import os
 import sys
 import tempfile
-from typing import Any, Sequence
+from typing import Any, Callable, Iterable, Iterator, Sequence
 
 from . import __version__
 from .checkpoint import (
@@ -70,14 +70,24 @@ def _parse_window(spec: str) -> Tumbling | Sliding | Session:
     )
 
 
-def _read_lines(path: str) -> list[str]:
-    if path == "-":
-        return sys.stdin.read().splitlines()
-    try:
-        with open(path, encoding="utf-8") as handle:
-            return handle.read().splitlines()
-    except OSError as error:
-        raise ValidationError(f"cannot read input: {error.strerror or error}", value=path) from error
+def _iter_numbered_lines(source: str) -> Iterator[tuple[int, str]]:
+    """Yield ``(line_number, raw_segment)`` for a file path or ``-`` (stdin).
+
+    Every execution mode is segmented the same way: input is read whole (newline translation
+    disabled for regular files, so a checkpoint prefix digest sees CRLF verbatim) and split with
+    ``str.splitlines(keepends=True)``. ``parse_event_line`` strips surrounding whitespace itself,
+    so the raw segment is also exactly what a checkpoint hashes.
+    """
+    if source == "-":
+        # stdin is decoded by the text wrapper; no checkpoint digest ever covers it.
+        raw = sys.stdin.read()
+    else:
+        try:
+            with open(source, encoding="utf-8", newline="") as handle:
+                raw = handle.read()
+        except OSError as error:
+            raise ValidationError(f"cannot read input: {error.strerror or error}", value=source) from error
+    yield from enumerate(raw.splitlines(keepends=True), start=1)
 
 
 def _write(path: str | None, lines: Sequence[str]) -> None:
@@ -112,20 +122,50 @@ def _assert_distinct(inputs: Sequence[str | None], output: str | None) -> None:
             raise OutputError("output path collides with an input path", value=output)
 
 
-def _collect(events_path: str, window_spec: str, aggregation: str, lateness: int, out_of_orderness: int) -> list[str]:
-    pipeline = Pipeline(
+def _build_pipeline(
+    window_spec: str, aggregation: str, lateness: int, out_of_orderness: int
+) -> Pipeline:
+    return Pipeline(
         windowing=_parse_window(window_spec),
         aggregation=aggregation,
         max_out_of_orderness=out_of_orderness,
         allowed_lateness=lateness,
     )
+
+
+def _ingest(
+    pipeline: Pipeline,
+    numbered_segments: Iterable[tuple[int, str]],
+    sink: list[str],
+    *,
+    after_line: Callable[[int], None] | None = None,
+) -> None:
+    """The single event-ingestion path shared by run, replay and every checkpointed execution.
+
+    Each raw segment is parsed under its *original* line number and handed to ``Pipeline.add``;
+    every window the current watermark closes in response is rendered canonically and appended to
+    ``sink`` in ``(window.start, key)`` order. ``after_line`` (used for per-line checkpoints) runs
+    only after the whole line succeeded. Never flushes: the end-of-input flush is the caller's
+    single, explicit step (``_finish``).
+    """
+    for number, segment in numbered_segments:
+        event = parse_event_line(segment, line=number)
+        sink.extend(canonical(result.to_document()) for result in pipeline.add(event))
+        if after_line is not None:
+            after_line(number)
+
+
+def _finish(pipeline: Pipeline, sink: list[str]) -> None:
+    """The one end-of-input flush: append everything the watermark never closed on its own."""
+    sink.extend(canonical(result.to_document()) for result in pipeline.flush())
+
+
+def _collect(events_path: str, window_spec: str, aggregation: str, lateness: int, out_of_orderness: int) -> list[str]:
+    """Drive one complete, non-persistent execution (plain run and each replay pass) via the engine."""
+    pipeline = _build_pipeline(window_spec, aggregation, lateness, out_of_orderness)
     lines: list[str] = []
-    for number, text in enumerate(_read_lines(events_path), start=1):
-        event = parse_event_line(text, line=number)
-        for result in pipeline.add(event):
-            lines.append(canonical(result.to_document()))
-    for result in pipeline.flush():
-        lines.append(canonical(result.to_document()))
+    _ingest(pipeline, _iter_numbered_lines(events_path), lines)
+    _finish(pipeline, lines)
     return lines
 
 
@@ -168,20 +208,6 @@ DEFAULT_WINDOW = "tumbling:1000"
 DEFAULT_AGGREGATION = "sum"
 DEFAULT_LATENESS = 0
 DEFAULT_OUT_OF_ORDERNESS = 0
-
-
-def _read_input_text(path: str) -> str:
-    """Read the whole input with newline translation disabled.
-
-    Keeping CR/LF verbatim makes the consumed-prefix digest sensitive to line-ending tampering and
-    lets the line segmentation agree exactly with ``str.splitlines`` (used by the non-checkpointed
-    path), including isolated carriage returns.
-    """
-    try:
-        with open(path, encoding="utf-8", newline="") as handle:
-            return handle.read()
-    except OSError as error:
-        raise ValidationError(f"cannot read input: {error.strerror or error}", value=path) from error
 
 
 def _resolved_config(args: argparse.Namespace, saved: dict[str, Any] | None) -> tuple[str, str, int, int]:
@@ -231,13 +257,7 @@ def _run_with_checkpoint(
         raise ValidationError("checkpoint status must be running or complete", value=saved.status)  # defensive
 
     window_spec, aggregation, lateness, out_of_orderness = _resolved_config(args, saved.config if saved else None)
-    windowing = _parse_window(window_spec)  # a saved-but-syntactically-invalid spec is a validation_error
-    pipeline = Pipeline(
-        windowing=windowing,
-        aggregation=aggregation,
-        max_out_of_orderness=out_of_orderness,
-        allowed_lateness=lateness,
-    )
+    pipeline = _build_pipeline(window_spec, aggregation, lateness, out_of_orderness)
     config = config_document(
         window=window_spec,
         aggregation=aggregation,
@@ -245,8 +265,9 @@ def _run_with_checkpoint(
         max_out_of_orderness=out_of_orderness,
     )
 
-    raw = _read_input_text(args.input)
-    segments = raw.splitlines(keepends=True)
+    # Segmentation comes from the same iterator every mode uses. It is materialized here because a
+    # resumed run must verify the consumed prefix (and its length) before performing any write.
+    segments = [segment for _, segment in _iter_numbered_lines(args.input)]
     total = len(segments)
 
     if saved is not None:
@@ -283,52 +304,28 @@ def _run_with_checkpoint(
     if saved is not None and saved.status == STATUS_COMPLETE:
         if consumed != total:
             raise ValidationError("input grew after the checkpoint completed", consumed=consumed, lines=total)
-        pending_complete = list(saved.pending)
-        _write(args.output, pending_complete)
-        digest = prefix_digest("".join(segments[:consumed]))
-        save_checkpoint(
-            checkpoint_path,
-            capture_state(
-                pipeline,
-                config=config,
-                consumed=consumed,
-                prefix_sha256=digest,
-                pending=pending_complete,
-                status=STATUS_COMPLETE,
-            ),
-        )
+        _write(args.output, pending)
+        persist(STATUS_COMPLETE)
         return EXIT_OK
 
-    # Process every line strictly past the consumed prefix. Results accumulate in `pending`; they
-    # are committed to the final file only on successful completion, while the checkpoint after each
-    # line already durably holds them, so a crash between lines loses nothing.
-    for number in range(consumed + 1, total + 1):
-        text = segments[number - 1].rstrip("\r\n")
-        event = parse_event_line(text, line=number)
-        for result in pipeline.add(event):
-            pending.append(canonical(result.to_document()))
+    # Process every line strictly past the consumed prefix through the shared ingestion path.
+    # Results accumulate in `pending` and are committed to the final file only on successful
+    # completion; the running checkpoint rewritten after each line already durably holds them, so a
+    # failure on a later line leaves the output untouched and the checkpoint at the last good line.
+    def checkpoint_line(number: int) -> None:
+        nonlocal consumed
         consumed = number
         persist(STATUS_RUNNING)
 
-    for result in pipeline.flush():
-        pending.append(canonical(result.to_document()))
-    consumed = total
+    numbered_suffix = ((number, segments[number - 1]) for number in range(consumed + 1, total + 1))
+    _ingest(pipeline, numbered_suffix, pending, after_line=checkpoint_line)
 
-    # Finish order: the full result file is atomically replaced exactly as an uninterrupted run
-    # would write it, and only then is the completion-state checkpoint left behind.
+    # Exactly one end-of-input flush, shared with every other mode; then finish in the same order
+    # as before: atomically replace the full result file, and only then leave the complete marker.
+    _finish(pipeline, pending)
+    consumed = total
     _write(args.output, pending)
-    digest = prefix_digest("".join(segments[:consumed]))
-    save_checkpoint(
-        checkpoint_path,
-        capture_state(
-            pipeline,
-            config=config,
-            consumed=consumed,
-            prefix_sha256=digest,
-            pending=pending,
-            status=STATUS_COMPLETE,
-        ),
-    )
+    persist(STATUS_COMPLETE)
     return EXIT_OK
 
 
