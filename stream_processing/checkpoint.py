@@ -24,14 +24,13 @@ from __future__ import annotations
 
 import hashlib
 import json
-import math
 import os
 import tempfile
 from dataclasses import dataclass
 from typing import Any, Sequence
 
 from .errors import OutputError, ParseError, ValidationError
-from .events import WatermarkTracker
+from .events import WatermarkTracker, is_finite_number
 from .pipeline import Pipeline
 
 CHECKPOINT_FORMAT = "stream-processing-checkpoint"
@@ -143,7 +142,7 @@ def _is_int(value: object) -> bool:
 
 def _is_number(value: object) -> bool:
     # bool is an int subclass; NaN/Infinity are non-standard JSON and never occur in a real state.
-    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+    return is_finite_number(value)
 
 
 def _reject_json_constant(value: str) -> None:

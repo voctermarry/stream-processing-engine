@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 from typing import Callable, Iterable
 
 from .errors import ValidationError
-from .events import DATA, Event, WatermarkTracker
+from .events import DATA, Event, WatermarkTracker, is_finite_number
 from .windows import Session, Sliding, Tumbling, Window, merge_sessions
 
 Aggregator = Callable[[list[float]], float]
@@ -62,6 +62,11 @@ class Pipeline:
 
     # -- input ---------------------------------------------------------------
     def add(self, event: Event) -> list[Result]:
+        # A caller-constructed event bypasses parsing, so the finite-value rule is enforced
+        # here too — before any watermark, counter or window state is touched, and for punct
+        # events as well, so no entry point disagrees with another.
+        if not is_finite_number(event.value):
+            raise ValidationError("event value must be a finite number", kind=event.kind)
         if event.kind != DATA:
             self.watermark.advance_to(event.timestamp)
             return self._emit(force_end=None)
@@ -130,10 +135,21 @@ class Pipeline:
 
     def _result(self, start: int, end: int, key: str, values: list[float] | None = None) -> Result:
         stored = values if values is not None else self._values[(start, end, key)]
+        value = AGGREGATORS[self.aggregation](stored)
+        if not is_finite_number(value):
+            # Finite inputs can still overflow sum/mean. Refuse before the result exists and
+            # before the window is marked emitted, so no partial output is ever produced.
+            raise ValidationError(
+                "aggregation result is not a finite number",
+                aggregation=self.aggregation,
+                key=key,
+                start=start,
+                end=end,
+            )
         return Result(
             window=Window(start, end),
             key=key,
             aggregation=self.aggregation,
-            value=AGGREGATORS[self.aggregation](stored),
+            value=value,
             count=len(stored),
         )

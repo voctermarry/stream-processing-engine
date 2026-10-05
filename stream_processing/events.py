@@ -9,6 +9,8 @@ advances time without contributing a value). Keeping `punct` explicit means a st
 from __future__ import annotations
 
 import json
+import math
+import re
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Iterator
 
@@ -17,6 +19,51 @@ from .errors import ParseError, ValidationError
 DATA = "data"
 PUNCT = "punct"
 KINDS = (DATA, PUNCT)
+
+# NaN / Infinity / -Infinity are Python json extensions, not standard JSON. They are rejected
+# before decoding so the error column can point at the token's first character; `-Infinity`
+# must be tried before `Infinity` so the column lands on the minus sign.
+_NONSTANDARD_CONSTANT = re.compile(r"-Infinity|NaN|Infinity")
+
+
+def is_finite_number(value: object) -> bool:
+    """True for a real number (int/float, not bool) the engine's float domain can hold.
+
+    NaN and infinities are False; so is an integer too large to convert to a float
+    (``math.isfinite`` raises ``OverflowError`` on those instead of answering).
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        return math.isfinite(value)
+    except OverflowError:
+        return False
+
+
+def _find_nonstandard_constant(text: str) -> re.Match[str] | None:
+    """First NaN/Infinity token outside a string literal, or None.
+
+    A plain regex would also hit tokens inside string values (``{"key":"NaN"}`` is perfectly
+    valid input), so string literals — including escaped quotes — are skipped explicitly.
+    """
+    index = 0
+    while index < len(text):
+        if text[index] == '"':
+            index += 1
+            while index < len(text):
+                if text[index] == "\\":
+                    index += 2
+                elif text[index] == '"':
+                    index += 1
+                    break
+                else:
+                    index += 1
+            continue
+        match = _NONSTANDARD_CONSTANT.match(text, index)
+        if match is not None:
+            return match
+        index += 1
+    return None
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,6 +132,13 @@ def parse_event_line(text: str, *, line: int | None = None) -> Event:
     stripped = text.strip()
     if not stripped:
         raise ParseError("empty line", line=line, column=1)
+    constant = _find_nonstandard_constant(stripped)
+    if constant is not None:
+        raise ParseError(
+            f"non-standard JSON constant: {constant.group(0)}",
+            line=line,
+            column=constant.start() + 1,
+        )
     try:
         document = json.loads(stripped)
     except json.JSONDecodeError as error:
@@ -107,6 +161,10 @@ def parse_event_line(text: str, *, line: int | None = None) -> Event:
     value = document.get("value", 0.0)
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ParseError("value must be a number", line=line, column=1)
+    if not is_finite_number(value):
+        # e.g. 1e400: syntactically valid JSON, but outside the finite domain this engine
+        # accepts and emits. Checked for punct events too, so every entry point agrees.
+        raise ParseError("value must be a finite number", line=line, column=1)
     kind = document.get("kind", DATA)
     if kind not in KINDS:
         raise ParseError(f"kind must be one of {', '.join(KINDS)}", line=line, column=1)
