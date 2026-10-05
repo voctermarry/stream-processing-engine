@@ -7,11 +7,12 @@ returns the remainder. Results are always ordered by `(window.start, key)`.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import Callable, Iterable
 
 from .errors import ValidationError
-from .events import DATA, Event, WatermarkTracker
+from .events import DATA, Event, WatermarkTracker, is_finite_number
 from .windows import Session, Sliding, Tumbling, Window, merge_sessions
 
 Aggregator = Callable[[list[float]], float]
@@ -62,6 +63,12 @@ class Pipeline:
 
     # -- input ---------------------------------------------------------------
     def add(self, event: Event) -> list[Result]:
+        # Validate before touching any state: a rejected event leaves the watermark, the
+        # observed / late_dropped counters, the window values and the emitted set exactly as
+        # they were. Punctuation values are checked too -- they are never aggregated, but no
+        # entry point may accept what another rejects.
+        if not is_finite_number(event.value):
+            raise ValidationError("event value must be a finite number", value=repr(event.value))
         if event.kind != DATA:
             self.watermark.advance_to(event.timestamp)
             return self._emit(force_end=None)
@@ -130,10 +137,27 @@ class Pipeline:
 
     def _result(self, start: int, end: int, key: str, values: list[float] | None = None) -> Result:
         stored = values if values is not None else self._values[(start, end, key)]
+        try:
+            value = AGGREGATORS[self.aggregation](stored)
+        except OverflowError as error:
+            # sum/mean over huge Python ints (directly constructed events) can overflow float.
+            raise self._overflow_error(start, end, key) from error
+        if not math.isfinite(value):
+            # Every input was finite, yet the aggregate itself escaped the finite domain
+            # (e.g. 1e308 + 1e308): refuse the window result instead of emitting Infinity.
+            raise self._overflow_error(start, end, key)
         return Result(
             window=Window(start, end),
             key=key,
             aggregation=self.aggregation,
-            value=AGGREGATORS[self.aggregation](stored),
+            value=value,
             count=len(stored),
+        )
+
+    def _overflow_error(self, start: int, end: int, key: str) -> ValidationError:
+        return ValidationError(
+            "aggregation result is not finite",
+            aggregation=self.aggregation,
+            key=key,
+            window={"start": start, "end": end},
         )

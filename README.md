@@ -24,10 +24,10 @@ stream-processing-engine describe
 |---|---|---|
 | `timestamp` | 是 | 整数毫秒（Unix epoch）；**不接受**浮点或字符串 |
 | `key` | 是 | 非空字符串，聚合按 key 分开 |
-| `value` | 否 | 数字，缺省 `0`；`kind=punct` 时忽略 |
+| `value` | 否 | 数字，缺省 `0`；必须是**有限数值**——`NaN`/`Infinity`/`-Infinity` 及 `1e400` 这类溢写字面量一律 `parse_error`；`kind=punct` 时忽略（但仍校验） |
 | `kind` | 否 | `data`（默认，计入聚合）或 `punct`（推进时间的标点，不计值） |
 
-未知字段、类型错误、非法 JSON 都以 `parse_error` 报出，并带 `line`（1 起）与 `column`。
+未知字段、类型错误、非法 JSON 都以 `parse_error` 报出，并带 `line`（1 起）与 `column`；非标准数值常量的 `column` 定位到该常量的首字符。直接构造 `Event` 交给 `Pipeline.add` 时，非有限 `value` 以 `ValidationError` 拒绝，且水位线、计数器、窗口值与已发射集合均不变。
 
 ## 窗口
 
@@ -107,6 +107,7 @@ stream-processing-engine describe
 
 ## 保障
 
+- 数值域是有限的双精度浮点：输入只接受有限数值，输出只产生有限数值。即使每个输入 `value` 都有限，`sum`/`mean` 的结果仍可能溢出（如 `1e308 + 1e308`）——此时在产生该窗口结果之前返回 `validation_error`：stdout 不出现部分结果，既有 `--output` 文件保持原样，检查点执行不提交最终输出且检查点停留在最后一条完整成功处理的输入行（绝不保存含非有限值的状态），`replay` 不产出对账报告而以退出码 2 失败。
 - 未指定 `--output` 时只写 stdout；指定后**先写临时文件再原子替换**，失败不会留下半成品，也不会破坏旧文件。
 - 输出路径与任何输入路径相同 ⇒ 在读取之前报 `output_error`。
 - `windows` 只支持 `tumbling` 规格；其它规格报 `validation_error`。
